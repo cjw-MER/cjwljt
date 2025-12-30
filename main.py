@@ -12,36 +12,60 @@ from agent import RecommendationAgent
 from utils import load_json_file
 from baseline import metric_cal
 
+
 APIRequestFailedError = None
 
 
 def get_args():
     import argparse
     parser = argparse.ArgumentParser()
-    parser.add_argument('--item_database_file', type=str,
-                        default='/home/liujuntao/Agent4Rec/data/ml-1m/ml-1m.item.json')
-    parser.add_argument('--test_user_inter50_file', type=str,
-                        default='/home/liujuntao/ml-1m_user2000_inter50_.json')
-    parser.add_argument('--train_user_inter50_file', type=str,
-                        default='/home/liujuntao/Agent4Rec/data/ml-1m/user_train_inter50_1.json')
 
-    parser.add_argument('--planner_memory_use', type=bool, default=True)
-    parser.add_argument('--reasoner_memory_use', type=bool, default=True)
-    parser.add_argument('--reflector_memory_use', type=bool, default=False)
+    parser.add_argument(
+        "--item_database_file",
+        type=str,
+        default="/home/liujuntao/Agent4Rec/data/ml-1m/ml-1m.item.json",
+    )
+    parser.add_argument(
+        "--test_user_inter50_file",
+        type=str,
+        default="/home/liujuntao/ml-1m_user2000_inter50_.json",
+    )
+    parser.add_argument(
+        "--train_user_inter50_file",
+        type=str,
+        default="/home/liujuntao/Agent4Rec/data/ml-1m/user_train_inter50_1.json",
+    )
 
-    parser.add_argument('--user_emb_profile', type=str,
-                        default='/home/liujuntao/Agent4Rec/user_profile_sasrec_bottom10.json')
-    parser.add_argument('--tool_memory_file', type=str,
-                        default='/home/liujuntao/Agent4Rec/memory结构化版本/data/tool_memory_merge.json')
-    parser.add_argument('--reasoning_memory_file', type=str,
-                        default='/home/liujuntao/Agent4Rec/memory结构化版本/data/reasoning_memory_struct_1000.json')
+    parser.add_argument("--planner_memory_use", type=bool, default=True)
+    parser.add_argument("--reasoner_memory_use", type=bool, default=True)
+    parser.add_argument("--reflector_memory_use", type=bool, default=False)
 
-    parser.add_argument('--train', type=bool, default=False)
+    parser.add_argument(
+        "--user_emb_profile",
+        type=str,
+        default="/home/liujuntao/Agent4Rec/user_profile_sasrec_bottom10.json",
+    )
+    parser.add_argument(
+        "--tool_memory_file",
+        type=str,
+        default="/home/liujuntao/Agent4Rec/memory结构化版本/data/tool_memory_merge.json",
+    )
+    parser.add_argument(
+        "--reasoning_memory_file",
+        type=str,
+        default="/home/liujuntao/Agent4Rec/memory结构化版本/data/reasoning_memory_struct_1000.json",
+    )
 
-    parser.add_argument('--max_concurrency', type=int, default=100)
-    parser.add_argument('--max_users', type=int, default=1988)
+    parser.add_argument("--fixed_drop_ratio", type=float, default=0.4)
+    parser.add_argument("--max_filter_rounds", type=int, default=7)
+    parser.add_argument("--min_keep", type=int, default=5)
 
-    parser.add_argument('--output_root', type=str, default='./runs')
+    parser.add_argument("--train", type=bool, default=False)
+
+    parser.add_argument("--max_concurrency", type=int, default=100)
+    parser.add_argument("--max_users", type=int, default=1988)
+
+    parser.add_argument("--output_root", type=str, default="./runs")
     return parser.parse_args()
 
 
@@ -81,12 +105,13 @@ async def process_user(
 ) -> Dict[str, Any]:
     async with semaphore:
         try:
+            # agent.run 是同步函数：用 asyncio.to_thread 放到线程里跑，避免阻塞 event loop
             result = await asyncio.to_thread(
                 agent.run,
                 user_profile,
                 user_id,
                 target,
-                max_iterations=5,
+                max_iterations=7,
                 train_step=train_step,
                 train=train,
             )
@@ -102,8 +127,10 @@ async def process_user(
             done_counter["n"] += 1
             done_n = done_counter["n"]
 
-        print(f"[DONE] done={done_n}/{total_users} (i={i+1}) uid={user_id} skipped={out.get('skipped', False)}",
-              flush=True)
+        print(
+            f"[DONE] done={done_n}/{total_users} (i={i+1}) uid={user_id} skipped={out.get('skipped', False)}",
+            flush=True,
+        )
         return out
 
 
@@ -129,6 +156,7 @@ async def run_batch_recommendation(args, model, tokenizer):
         user = users[i]
         inters = all_inter[user]
         target = inters[-1]
+        print(f"Preparing user {i+1}/{max_users}: user_id={user}, target={target}", flush=True)
 
         history = {f"item_{j}": item_database[f"item_{j}"] for j in inters[-20:-1]}
         user_profile = f"""user_{user}'s interaction history:{history}"""
@@ -158,12 +186,10 @@ async def run_batch_recommendation(args, model, tokenizer):
     skipped_rows = [r for r in batch_results if r.get("skipped") is True]
     skipped_uid_set = sorted(set(r["user_id"] for r in skipped_rows))
 
-    # 有效用户（用于评测）
     ok_user_ids = [r["user_id"] for r in ok_rows]
     results = [r["result"] for r in ok_rows]
     ground_truth = [int(r["target"]) for r in ok_rows]
 
-    # top10 pad
     results_top10 = []
     for recs in results:
         if isinstance(recs, list) and len(recs) >= 10:
@@ -171,38 +197,44 @@ async def run_batch_recommendation(args, model, tokenizer):
         else:
             results_top10.append(recs)
 
-    # 保存 run 目录内所有文件
     with open(os.path.join(run_dir, "skipped_uids.txt"), "w", encoding="utf-8") as f:
         for uid in skipped_uid_set:
             f.write(str(uid) + "\n")
 
-    dump_json(os.path.join(run_dir, "summary.json"), {
-        "run_dir": run_dir,
-        "time": datetime.now().isoformat(timespec="seconds"),
-        "elapsed_seconds": elapsed,
-        "total_users": len(batch_results),
-        "ok_users": len(ok_rows),
-        "skipped_users": len(skipped_uid_set),
-        "max_concurrency": int(args.max_concurrency),
-        "max_users": int(max_users),
-    })
+    dump_json(
+        os.path.join(run_dir, "summary.json"),
+        {
+            "run_dir": run_dir,
+            "time": datetime.now().isoformat(timespec="seconds"),
+            "elapsed_seconds": elapsed,
+            "total_users": len(batch_results),
+            "ok_users": len(ok_rows),
+            "skipped_users": len(skipped_uid_set),
+            "max_concurrency": int(args.max_concurrency),
+            "max_users": int(max_users),
+            "fixed_drop_ratio": float(getattr(args, "fixed_drop_ratio", 0.2)),
+            "min_keep": int(getattr(args, "min_keep", 5)),
+            "max_filter_rounds": int(getattr(args, "max_filter_rounds", 3)),
+        },
+    )
     dump_json(os.path.join(run_dir, "ok_user_ids.json"), ok_user_ids)
     dump_json(os.path.join(run_dir, "ground_truth_ok.json"), ground_truth)
     dump_json(os.path.join(run_dir, "results_ok_top10.json"), results_top10)
     dump_json(os.path.join(run_dir, "skipped_rows.json"), skipped_rows)
 
     print(f"[DONE] run_dir={run_dir}", flush=True)
-    print(f"[DONE] total={len(batch_results)} ok={len(ok_rows)} skipped={len(skipped_uid_set)} elapsed={elapsed:.3f}s",
-          flush=True)
+    print(
+        f"[DONE] total={len(batch_results)} ok={len(ok_rows)} skipped={len(skipped_uid_set)} elapsed={elapsed:.3f}s",
+        flush=True,
+    )
 
-    # ===== 修复：显式传 ok_user_ids，确保评测用户与结果对齐 =====
     metric_cal(
         candidate_items=results_top10,
         k=10,
-        selected_users_path=args.test_user_inter50_file,  # 仍保留原文件路径用于读取/映射
-        out_dir=run_dir,                                  # 指标存到本次 run 文件夹
+        selected_users_path=args.test_user_inter50_file,
+        out_dir=run_dir,
         out_prefix="Agent4Rec",
-        eval_user_tokens=ok_user_ids,                     # 关键：避免跳过用户导致错位
+        eval_user_tokens=ok_user_ids,
     )
 
     return run_dir
