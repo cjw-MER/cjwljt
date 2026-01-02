@@ -56,14 +56,15 @@ def get_args():
         default="/home/liujuntao/Agent4Rec/memory结构化版本/data/reasoning_memory_struct_1000.json",
     )
 
+    # 新版 agent 建议显式加这些参数（与你之前“固定丢弃率/保底 min_keep”一致）
     parser.add_argument("--fixed_drop_ratio", type=float, default=0.4)
-    parser.add_argument("--max_filter_rounds", type=int, default=7)
+    parser.add_argument("--max_filter_rounds", type=int, default=3)
     parser.add_argument("--min_keep", type=int, default=5)
 
     parser.add_argument("--train", type=bool, default=False)
 
     parser.add_argument("--max_concurrency", type=int, default=100)
-    parser.add_argument("--max_users", type=int, default=1988)
+    parser.add_argument("--max_users", type=int, default=20)
 
     parser.add_argument("--output_root", type=str, default="./runs")
     return parser.parse_args()

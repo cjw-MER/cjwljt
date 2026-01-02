@@ -1,3 +1,4 @@
+# agent.py
 import os
 import math
 from typing import Dict, List, Any
@@ -6,17 +7,21 @@ from langgraph.graph import StateGraph, END
 
 from prompts import planner, reasoner, reflector
 from utils import load_json_file, safe_parse_json
+
+# 外部工具函数：过滤
+from utils import apply_tool_filter
+from utils import find_most_similar_user_id
+
 from state import RecommendationState
 from tools import retrieval_topk_load, stdout_retrived_items_load
 from api import ZHI
 
 from rec_utils.tokens import normalize_candidate_tokens
 from rec_utils.memmap_ranker import MemmapRanker
-from rec_utils.rec_helpers import ToolRegistry, format_candidates_with_meta, SimilarMemoryRetriever
+from rec_utils.rec_helpers import ToolRegistry, format_candidates_with_meta
 
 
 class RecommendationAgent:
-
     def __init__(self, args, model=None, tokenizer=None):
         self.args = args
         self.model = model
@@ -25,9 +30,8 @@ class RecommendationAgent:
         # 固定丢弃率（不再从 reflector 读取）
         self.fixed_drop_ratio = float(getattr(args, "fixed_drop_ratio", 0.2))
 
-        # memories（如不需要，可整段删掉）
+        # memories
         self.reasoning_memory = load_json_file(args.reasoning_memory_file)
-        self.sim_mem = SimilarMemoryRetriever(self.reasoning_memory)
 
         # item meta
         meta_path = getattr(args, "item_meta_file", "/home/liujuntao/Agent4Rec/data/ml-1m/ml-1m.item.json")
@@ -70,8 +74,14 @@ class RecommendationAgent:
         user_id = state["user_id"]
 
         similar_memory = None
-        if getattr(self.args, "planner_memory_use", False):
-            similar_memory = self.sim_mem.get(self.args.user_emb_profile, user_id)
+        if getattr(self.args, "planner_memory_use", False) and self.reasoning_memory:
+            can_users = list(self.reasoning_memory.keys())
+            similar_user_id = find_most_similar_user_id(
+                file_path=self.args.user_emb_profile,
+                user_id=str(user_id),
+                candidate_users=can_users,
+            )
+            similar_memory = self.reasoning_memory.get(similar_user_id)
 
         planner_prompt = planner(user_profile, similar_memory) if similar_memory else planner(user_profile)
 
@@ -87,8 +97,6 @@ class RecommendationAgent:
             {"role": "user", "content": planner_prompt},
         ]
         data = safe_parse_json(self.api_planner.chat(messages))
-
-        self.conv_logger.log_turn(state, stage="planner", messages=messages, response=response, parsed=data)
 
         state["planner_intention"] = data.get("planner_intention", "")
         state["planner_explanation"] = data.get("planner_reasoning", "")
@@ -122,39 +130,35 @@ class RecommendationAgent:
 
         tokens_before_filter = list(tokens_in)
 
-        # 2) 工具过滤/重排：第一次强制 rank（drop_ratio=0），后续 tool 模式固定 drop_ratio
+        # 2) 工具过滤/重排：用 iteration_count 控制过滤轮次
         min_keep = int(state.get("min_keep", getattr(self.args, "min_keep", 5)))
         max_filter_rounds = int(state.get("max_filter_rounds", getattr(self.args, "max_filter_rounds", 3)))
-        filter_round = int(state.get("filter_round", 0))
         filter_mode = str(state.get("filter_mode", "tool")).lower()
+        iteration_count = int(state.get("iteration_count", 0))
 
-        has_tool_filtered = bool(state.get("has_tool_filtered", False))
-        force_first = not has_tool_filtered
+        if (
+            filter_mode == "tool"
+            and iteration_count < max_filter_rounds
+            and len(tokens_in) > min_keep
+        ):
+            filter_tool = self.tool_registry.normalize(state.get("filter_tool") or "glintru")
+            mem_dir = self.tool_registry.memmap_dir(filter_tool)
 
-        filter_tool = self.tool_registry.normalize(state.get("filter_tool") or "glintru")
-        mem_dir = self.tool_registry.memmap_dir(filter_tool)
-
-        def apply_tool_filter(tokens: List[str], drop_ratio: float) -> List[str]:
-            out_tokens, _ = self.mem_ranker.rank(
+            tokens_in = apply_tool_filter(
+                mem_ranker=self.mem_ranker,
                 mem_dir=mem_dir,
                 user_id=str(user_id),
-                candidate_tokens=tokens,
-                drop_ratio=drop_ratio,
-                drop_unknown=True,
+                candidate_tokens=tokens_in,
+                drop_ratio=self.fixed_drop_ratio,
                 min_keep=min_keep,
+                drop_unknown=True,
             )
-            return out_tokens if out_tokens else tokens  
 
-        did_filter = False
-        if force_first:
-            tokens_in = apply_tool_filter(tokens_in, 0.0)
-            state["has_tool_filtered"] = True
-            did_filter = True
-        elif filter_mode == "tool":
-            if filter_round < max_filter_rounds and len(tokens_in) > min_keep:
-                tokens_in = apply_tool_filter(tokens_in, self.fixed_drop_ratio)
-                did_filter = True
-
+            used = state.get("used_filter_tools", [])
+            if not isinstance(used, list):
+                used = []
+            used.append(filter_tool)
+            state["used_filter_tools"] = used
 
         if len(tokens_in) < min_keep and len(tokens_before_filter) >= min_keep:
             seen = set(tokens_in)
@@ -164,16 +168,6 @@ class RecommendationAgent:
                     seen.add(x)
                 if len(tokens_in) >= min_keep:
                     break
-
-        if did_filter:
-            used = state.get("used_filter_tools", [])
-            if not isinstance(used, list):
-                used = []
-            used.append(filter_tool)
-            state["used_filter_tools"] = used
-
-            if filter_round < max_filter_rounds and len(tokens_in) > min_keep:
-                state["filter_round"] = filter_round + 1
 
         state["candidate_items"] = normalize_candidate_tokens(tokens_in)
         return state
@@ -189,8 +183,14 @@ class RecommendationAgent:
         planner_reasoning = state.get("planner_explanation", "")
 
         similar_memory = None
-        if getattr(self.args, "reasoner_memory_use", False):
-            similar_memory = self.sim_mem.get(self.args.user_emb_profile, state["user_id"])
+        if getattr(self.args, "reasoner_memory_use", False) and self.reasoning_memory:
+            can_users = list(self.reasoning_memory.keys())
+            similar_user_id = find_most_similar_user_id(
+                file_path=self.args.user_emb_profile,
+                user_id=str(state["user_id"]),
+                candidate_users=can_users,
+            )
+            similar_memory = self.reasoning_memory.get(similar_user_id)
 
         prompt = reasoner(
             formatted_candidates,
@@ -236,8 +236,14 @@ class RecommendationAgent:
         formatted_candidates = format_candidates_with_meta(candidate_items_before, self.item_meta)
 
         similar_memory = None
-        if getattr(self.args, "reflector_memory_use", False):
-            similar_memory = self.sim_mem.get(self.args.user_emb_profile, state["user_id"])
+        if getattr(self.args, "reflector_memory_use", False) and self.reasoning_memory:
+            can_users = list(self.reasoning_memory.keys())
+            similar_user_id = find_most_similar_user_id(
+                file_path=self.args.user_emb_profile,
+                user_id=str(state["user_id"]),
+                candidate_users=can_users,
+            )
+            similar_memory = self.reasoning_memory.get(similar_user_id)
 
         used_filter_tools = state.get("used_filter_tools", [])
         prompt = reflector(
@@ -252,7 +258,6 @@ class RecommendationAgent:
             used_filter_tools=used_filter_tools,
         )
 
-        # drop_ratio 已从输出 schema 移除
         system_prompt = """Output a JSON object strictly following this format:
         {
           "filter_mode": "tool" or "llm" or "none",
@@ -266,10 +271,9 @@ class RecommendationAgent:
 
         state["filter_mode"] = str(data.get("filter_mode", "tool")).lower()
         state["filter_tool"] = self.tool_registry.normalize(data.get("filter_tool") or "glintru")
-        # print(f"Reflector chose filter_mode={state['filter_mode']} filter_tool={state['filter_tool']}")
         state["filter_plan_reason"] = str(data.get("filter_plan_reason", ""))
 
-        
+        # llm 模式：重排 + 固定丢弃率裁剪
         if state["filter_mode"] == "llm":
             min_keep = int(state.get("min_keep", getattr(self.args, "min_keep", 5)))
             re_ranked = normalize_candidate_tokens(data.get("re_ranked_candidate_items", []))
@@ -277,9 +281,6 @@ class RecommendationAgent:
             if re_ranked:
                 base_set = set(candidate_items_before)
                 valid_ranked = [x for x in re_ranked if x in base_set]
-                # valid_set = set(valid_ranked)
-                # missing = [x for x in candidate_items_before if x not in valid_set]
-                # merged = valid_ranked + missing
                 merged = valid_ranked
             else:
                 merged = candidate_items_before
@@ -295,18 +296,18 @@ class RecommendationAgent:
 
     def should_continue_or_finish(self, state: RecommendationState) -> str:
         need_filter = bool(state.get("need_filter", False))
-        print("need_filter =", need_filter)
-        filter_round = int(state.get("filter_round", 0))
+
+        iteration_count = int(state.get("iteration_count", 0))
         max_filter_rounds = int(state.get("max_filter_rounds", getattr(self.args, "max_filter_rounds", 3)))
+
         min_keep = int(state.get("min_keep", getattr(self.args, "min_keep", 5)))
         cand_len = len(normalize_candidate_tokens(state.get("candidate_items", [])))
 
-        if need_filter and (filter_round < max_filter_rounds) and (cand_len > min_keep):
+        if need_filter and (iteration_count < max_filter_rounds) and (cand_len > min_keep):
             return "continue"
 
         judgment = str(state.get("reasoner_judgment", "valid"))
         confidence = float(state.get("confidence", 1.0))
-        iteration_count = int(state.get("iteration_count", 0))
         max_iterations = int(state.get("max_iterations", 0))
 
         if ("invalid" in judgment or confidence < 0.85) and iteration_count < max_iterations:
@@ -339,7 +340,7 @@ class RecommendationAgent:
             "iteration_count": 0,
             "max_iterations": int(max_iterations),
 
-            "filter_round": 0,
+            # 用 iteration_count 控制过滤轮次
             "max_filter_rounds": int(getattr(self.args, "max_filter_rounds", 3)),
             "min_keep": int(getattr(self.args, "min_keep", 5)),
 
