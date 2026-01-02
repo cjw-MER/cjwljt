@@ -1,4 +1,3 @@
-# agent.py
 import os
 import math
 from typing import Dict, List, Any
@@ -88,6 +87,8 @@ class RecommendationAgent:
             {"role": "user", "content": planner_prompt},
         ]
         data = safe_parse_json(self.api_planner.chat(messages))
+
+        self.conv_logger.log_turn(state, stage="planner", messages=messages, response=response, parsed=data)
 
         state["planner_intention"] = data.get("planner_intention", "")
         state["planner_explanation"] = data.get("planner_reasoning", "")
@@ -294,6 +295,7 @@ class RecommendationAgent:
 
     def should_continue_or_finish(self, state: RecommendationState) -> str:
         need_filter = bool(state.get("need_filter", False))
+        print("need_filter =", need_filter)
         filter_round = int(state.get("filter_round", 0))
         max_filter_rounds = int(state.get("max_filter_rounds", getattr(self.args, "max_filter_rounds", 3)))
         min_keep = int(state.get("min_keep", getattr(self.args, "min_keep", 5)))

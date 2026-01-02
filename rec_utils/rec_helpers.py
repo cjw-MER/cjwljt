@@ -49,7 +49,6 @@ class ToolRegistry:
         key = self.normalize(tool_name)
         if key in self.tool_to_dir:
             return self.tool_to_dir[key]
-        # 默认兜底（也可以改成 raise）
         return self.tool_to_dir.get("glintru", "")
 
 
