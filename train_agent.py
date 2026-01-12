@@ -527,7 +527,7 @@ class RecommendationAgent:
             reward_funcs=tool_accuracy_reward,
         )
         trainer.train()
-
+        # 测试结束
         text = self.tokenizer.apply_chat_template(messages, tokenize=False)
         inputs = self.tokenizer(text, return_tensors="pt").to(self.model.device)
         with torch.inference_mode():
